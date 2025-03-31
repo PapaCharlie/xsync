@@ -66,7 +66,7 @@ type MapOf[K comparable, V any] = Map[K, V]
 // (immutable K/V pair structs instead of atomic snapshots)
 // and C++'s absl::flat_hash_map (meta memory and SWAR-based
 // lookups).
-type Map[K comparable, V any] struct {
+type Map[K, V any] struct {
 	totalGrowths int64
 	totalShrinks int64
 	resizing     int64          // resize in progress flag; updated atomically
@@ -75,9 +75,12 @@ type Map[K comparable, V any] struct {
 	table        unsafe.Pointer // *mapTable
 	minTableLen  int
 	growOnly     bool
+
+	hash func(maphash.Seed, K) uint64
+	eq   func(left, right K) bool
 }
 
-type mapTable[K comparable, V any] struct {
+type mapTable[K, V any] struct {
 	buckets []bucketPadded
 	// striped counter for number of table entries;
 	// used to determine if a table shrinking is needed
@@ -108,7 +111,7 @@ type bucket struct {
 }
 
 // entry is an immutable map entry.
-type entry[K comparable, V any] struct {
+type entry[K, V any] struct {
 	key   K
 	value V
 }
@@ -149,6 +152,18 @@ func NewMapOf[K comparable, V any](options ...func(*MapConfig)) *Map[K, V] {
 // NewMap creates a new Map instance configured with the given
 // options.
 func NewMap[K comparable, V any](options ...func(*MapConfig)) *Map[K, V] {
+	return NewCustomMap[K, V](
+		maphash.Comparable,
+		func(left, right K) bool { return left == right },
+		options...,
+	)
+}
+
+func NewCustomMap[K, V any](
+	hash func(maphash.Seed, K) uint64,
+	eq func(left, right K) bool,
+	options ...func(*MapConfig),
+) *Map[K, V] {
 	c := &MapConfig{
 		sizeHint: defaultMinMapTableLen * entriesPerMapBucket,
 	}
@@ -156,7 +171,10 @@ func NewMap[K comparable, V any](options ...func(*MapConfig)) *Map[K, V] {
 		o(c)
 	}
 
-	m := &Map[K, V]{}
+	m := &Map[K, V]{
+		hash: hash,
+		eq:   eq,
+	}
 	m.resizeCond = *sync.NewCond(&m.resizeMu)
 	var table *mapTable[K, V]
 	if c.sizeHint <= defaultMinMapTableLen*entriesPerMapBucket {
@@ -171,7 +189,7 @@ func NewMap[K comparable, V any](options ...func(*MapConfig)) *Map[K, V] {
 	return m
 }
 
-func newMapTable[K comparable, V any](minTableLen int) *mapTable[K, V] {
+func newMapTable[K, V any](minTableLen int) *mapTable[K, V] {
 	buckets := make([]bucketPadded, minTableLen)
 	for i := range buckets {
 		buckets[i].meta = defaultMeta
@@ -211,7 +229,7 @@ func ToPlainMap[K comparable, V any](m *Map[K, V]) map[K]V {
 // The ok result indicates whether value was found in the map.
 func (m *Map[K, V]) Load(key K) (value V, ok bool) {
 	table := (*mapTable[K, V])(atomic.LoadPointer(&m.table))
-	hash := maphash.Comparable(table.seed, key)
+	hash := m.hash(table.seed, key)
 	h1 := h1(hash)
 	h2w := broadcast(h2(hash))
 	bidx := uint64(len(table.buckets)-1) & h1
@@ -224,7 +242,7 @@ func (m *Map[K, V]) Load(key K) (value V, ok bool) {
 			eptr := atomic.LoadPointer(&b.entries[idx])
 			if eptr != nil {
 				e := (*entry[K, V])(eptr)
-				if e.key == key {
+				if m.eq(e.key, key) {
 					return e.value, true
 				}
 			}
@@ -398,7 +416,7 @@ func (m *Map[K, V]) doCompute(
 		)
 		table := (*mapTable[K, V])(atomic.LoadPointer(&m.table))
 		tableLen := len(table.buckets)
-		hash := maphash.Comparable(table.seed, key)
+		hash := m.hash(table.seed, key)
 		h1 := h1(hash)
 		h2 := h2(hash)
 		h2w := broadcast(h2)
@@ -427,7 +445,7 @@ func (m *Map[K, V]) doCompute(
 				eptr := b.entries[idx]
 				if eptr != nil {
 					e := (*entry[K, V])(eptr)
-					if e.key == key {
+					if m.eq(e.key, key) {
 						if loadIfExists {
 							rootb.mu.Unlock()
 							return e.value, !computeOnly
@@ -598,7 +616,7 @@ func (m *Map[K, V]) resize(knownTable *mapTable[K, V], hint mapResizeHint) {
 	// Copy the data only if we're not clearing the map.
 	if hint != mapClearHint {
 		for i := 0; i < tableLen; i++ {
-			copied := copyBucket(&table.buckets[i], newTable)
+			copied := m.copyBucket(&table.buckets[i], newTable)
 			newTable.addSizePlain(uint64(i), copied)
 		}
 	}
@@ -610,7 +628,7 @@ func (m *Map[K, V]) resize(knownTable *mapTable[K, V], hint mapResizeHint) {
 	m.resizeMu.Unlock()
 }
 
-func copyBucket[K comparable, V any](
+func (m *Map[K, V]) copyBucket(
 	b *bucketPadded,
 	destTable *mapTable[K, V],
 ) (copied int) {
@@ -620,7 +638,7 @@ func copyBucket[K comparable, V any](
 		for i := 0; i < entriesPerMapBucket; i++ {
 			if b.entries[i] != nil {
 				e := (*entry[K, V])(b.entries[i])
-				hash := maphash.Comparable(destTable.seed, e.key)
+				hash := m.hash(destTable.seed, e.key)
 				bidx := uint64(len(destTable.buckets)-1) & h1(hash)
 				destb := &destTable.buckets[bidx]
 				appendToBucket(h2(hash), b.entries[i], destb)
